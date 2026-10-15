@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# ghnew — create a GitHub repo from the current folder, push everything, and link it.
+set -euo pipefail
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+
+command -v gh  >/dev/null || { red "GitHub CLI (gh) not found. Install: brew install gh"; exit 1; }
+command -v git >/dev/null || { red "git not found."; exit 1; }
+gh auth status >/dev/null 2>&1 || { red "Not logged in to GitHub. Run: gh auth login"; exit 1; }
+
+DIR="$(pwd)"
+if [[ "$DIR" == "$HOME" || "$DIR" == "/" ]]; then
+  red "Refusing to publish your home or root directory."; exit 1
+fi
+
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  TOP="$(git rev-parse --show-toplevel)"
+  if [[ "$TOP" != "$DIR" ]]; then
+    red "This folder is inside another git repo ($TOP). Run ghnew from that repo's root or move the folder."; exit 1
+  fi
+  if git remote get-url origin >/dev/null 2>&1; then
+    red "This repo already has an 'origin' remote: $(git remote get-url origin)"; exit 1
+  fi
+fi
+
+bold "Publishing: $DIR"
+echo
+
+# Visibility
+while true; do
+  read -rp "Public or private? [pub/priv] (default: priv): " VIS
+  case "$(printf "%s" "$VIS" | tr "[:upper:]" "[:lower:]")" in
+    ""|priv|private|p) VIS_FLAG="--private"; break ;;
+    pub|public)      VIS_FLAG="--public";  break ;;
+    *) echo "Please answer 'pub' or 'priv'." ;;
+  esac
+done
+
+# Title -> repo name (GitHub disallows spaces etc.)
+DEFAULT_NAME="$(basename "$DIR")"
+read -rp "Repo title (default: $DEFAULT_NAME): " TITLE
+TITLE="${TITLE:-$DEFAULT_NAME}"
+NAME="$(printf '%s' "$TITLE" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+[[ -z "$NAME" ]] && { red "Invalid title."; exit 1; }
+[[ "$NAME" != "$TITLE" ]] && echo "  → repo name will be: $NAME"
+
+# Description
+read -rp "Short description (optional, Enter to skip): " DESC
+
+# Init + commit
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git init -q -b main
+fi
+# Does the project contain a file matching any of these names? (skips dependency/build dirs)
+has() {
+  local expr=() n
+  for n in "$@"; do expr+=(-o -name "$n"); done
+  [[ -n "$(find . -maxdepth 4 \
+      \( -name .git -o -name node_modules -o -name .venv -o -name venv -o -name target -o -name build -o -name dist -o -name .pio \) -prune \
+      -o \( -false "${expr[@]}" \) -print -quit 2>/dev/null)" ]]
+}
+
+generate_gitignore() {
+  local found=()
+  cat <<'EOF'
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors / IDEs
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*~
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+
+# Logs
+*.log
+logs/
+EOF
+  if has package.json; then found+=(Node); cat <<'EOF'
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.npm/
+.yarn/*
+!.yarn/releases
+dist/
+build/
+out/
+coverage/
+.next/
+.nuxt/
+.svelte-kit/
+.astro/
+.vercel/
+.netlify/
+.turbo/
+.cache/
+.parcel-cache/
+*.tsbuildinfo
+EOF
+  fi
+  if has '*.py' requirements.txt pyproject.toml setup.py Pipfile '*.ipynb'; then found+=(Python); cat <<'EOF'
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+EOF
+  fi
+  if has Cargo.toml; then found+=(Rust); printf '\n# Rust\ntarget/\n'; fi
+  if has go.mod; then found+=(Go); printf '\n# Go\n/bin/\n*.exe\n*.test\n*.out\nvendor/\n'; fi
+  if has pom.xml build.gradle build.gradle.kts '*.java' '*.kt'; then found+=(Java/Kotlin); cat <<'EOF'
+
+# Java / Kotlin
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+target/
+build/
+.gradle/
+out/
+*.iml
+local.properties
+EOF
+  fi
+  if has '*.csproj' '*.sln' '*.fsproj'; then found+=(.NET); printf '\n# .NET\nbin/\nobj/\n*.user\n.vs/\n'; fi
+  if has Package.swift '*.xcodeproj' '*.xcworkspace' '*.swift'; then found+=(Swift/Xcode); cat <<'EOF'
+
+# Swift / Xcode
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.swiftpm/
+Pods/
+*.ipa
+*.dSYM.zip
+*.dSYM
+EOF
+  fi
+  if has platformio.ini; then found+=(PlatformIO); printf '\n# PlatformIO\n.pio/\n.pioenvs/\n.piolibdeps/\n.vscode/c_cpp_properties.json\n.vscode/launch.json\n'; fi
+  if has CMakeLists.txt Makefile '*.c' '*.cpp' '*.h' '*.hpp' '*.ino'; then found+=(C/C++); cat <<'EOF'
+
+# C / C++
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+compile_commands.json
+EOF
+  fi
+  if has Gemfile; then found+=(Ruby); printf '\n# Ruby\n/.bundle/\nvendor/bundle/\n/tmp/\n/log/\n'; fi
+  if has composer.json; then found+=(PHP); printf '\n# PHP\nvendor/\n'; fi
+  if has pubspec.yaml; then found+=(Flutter/Dart); printf '\n# Flutter / Dart\n.dart_tool/\n.flutter-plugins*\n.packages\nbuild/\n'; fi
+  if has '*.tf'; then found+=(Terraform); printf '\n# Terraform\n.terraform/\n*.tfstate\n*.tfstate.*\n*.tfvars\n!*.tfvars.example\n'; fi
+  if [[ -d Assets && -d ProjectSettings ]]; then found+=(Unity); printf '\n# Unity\n[Ll]ibrary/\n[Tt]emp/\n[Oo]bj/\n[Bb]uild/\n[Ll]ogs/\n[Uu]ser[Ss]ettings/\n*.csproj\n*.sln\n'; fi
+  DETECTED="${found[*]:-none}"
+}
+
+if [[ -f .gitignore ]]; then
+  echo "Using existing .gitignore"
+else
+  generate_gitignore > .gitignore
+  echo "Created .gitignore (detected: $DETECTED)"
+fi
+
+# Warn about files GitHub will reject (>100MB) — only files git will actually add
+BIG="$(git ls-files -co --exclude-standard | while IFS= read -r f; do
+  [[ -f "$f" && $(wc -c < "$f") -gt 104857600 ]] && printf '%s\n' "$f"; done || true)"
+if [[ -n "$BIG" ]]; then
+  red "These files exceed GitHub's 100MB limit and will make the push fail:"
+  echo "$BIG"
+  read -rp "Add them to .gitignore and continue? [Y/n]: " ANS
+  if [[ "${ANS:-y}" =~ ^[Yy] ]]; then
+    printf '%s\n' "$BIG" | sed 's|^\./||' >> .gitignore
+  else
+    exit 1
+  fi
+fi
+
+git add -A
+if ! git rev-parse HEAD >/dev/null 2>&1 || ! git diff --cached --quiet; then
+  git commit -q -m "Initial commit" || { red "Commit failed (is git user.name/user.email set?)"; exit 1; }
+fi
+
+# Create, link, push
+ARGS=("$NAME" "$VIS_FLAG" --source=. --remote=origin --push)
+[[ -n "$DESC" ]] && ARGS+=(--description "$DESC")
+gh repo create "${ARGS[@]}"
+
+URL="$(gh repo view "$NAME" --json url -q .url 2>/dev/null || git remote get-url origin | sed 's/\.git$//')"
+echo
+green "✔ Done! Folder is linked to origin and pushed."
+bold  "  $URL"
